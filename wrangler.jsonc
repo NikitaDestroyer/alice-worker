@@ -1,0 +1,6 @@
+{
+  "name": "alice-runner",
+  "main": "cloudflare/worker.js",
+  "compatibility_date": "2026-04-07",
+  "compatibility_flags": ["enable_request_signal"]
+}
