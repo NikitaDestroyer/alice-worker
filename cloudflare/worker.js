@@ -4,6 +4,10 @@ const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 const applicationID = "ru.yandex.webstandalone.desktop";
 const aliceModel = { id: "alice", object: "model", created: 0, owned_by: "yandex" };
 const gigachatModel = { id: "gigachat", object: "model", created: 0, owned_by: "sber" };
+const gigachatOrigin = "https://giga.chat";
+const gigachatInitPath = "/api/smartproxy/api/public/gigachat/init";
+const gigachatChatPath = "/api/smartproxy/api/gc-public/api/v0/sessions/request";
+const gigachatSessions = [];
 const maxBodyBytes = 256 * 1024;
 const decoder = new TextDecoder();
 
@@ -457,54 +461,209 @@ function openAIError(status, message, code, param = null) {
   return Response.json({ error: { message, type, param, code } }, { status });
 }
 
-function gigachatEndpoint(env) {
-  if (!env.GIGACHAT_RUNNER_URL) return null;
+class GigachatError extends Error {
+  constructor(status, message, code = "upstream", retryable = false) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.retryable = retryable;
+  }
+}
+
+function gigachatBaseURL(env) {
   try {
-    const url = new URL(env.GIGACHAT_RUNNER_URL);
+    const url = new URL(env.GIGACHAT_BASE_URL || gigachatOrigin);
     const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
     if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback)) return null;
-    if (url.username || url.password || url.search || url.hash) return null;
-    url.pathname = url.pathname.replace(/\/+$/, "") + "/query";
-    return url;
+    if (url.username || url.password || url.search || url.hash || url.pathname !== "/") return null;
+    return url.origin;
   } catch {
     return null;
   }
 }
 
-async function runGigachatQuery(request, env, prompt) {
-  const endpoint = gigachatEndpoint(env);
-  if (!endpoint) return { status: 503, error: "GigaChat runner is not configured", code: "model_unavailable" };
+function gigachatHeaders(origin, deviceID, requestID) {
+  return {
+    "Origin": origin,
+    "Referer": origin + "/",
+    "X-Device-Id": deviceID,
+    "X-Request-Id": requestID,
+  };
+}
 
-  const headers = { "Content-Type": "application/json", Accept: "application/json" };
-  if (env.GIGACHAT_RUNNER_TOKEN) headers.Authorization = "Bearer " + env.GIGACHAT_RUNNER_TOKEN;
-  const deadline = AbortSignal.timeout(300_000);
-  const signal = AbortSignal.any([request.signal, deadline]);
+async function checkGigachatResponse(response, stage) {
+  if (response.status === 200) return;
+  await response.body?.cancel();
+  if (response.status === 429) throw new GigachatError(429, "GigaChat rate limit exceeded", "rate_limited");
+  if (response.status === 401 || response.status === 403) {
+    throw new GigachatError(502, `GigaChat ${stage} returned HTTP ${response.status}`, "upstream_auth", stage === "chat");
+  }
+  throw new GigachatError(502, `GigaChat ${stage} returned HTTP ${response.status}`, "upstream", response.status >= 500);
+}
+
+function gigachatCookieExpiry(cookie) {
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ prompt }),
-      redirect: "manual",
-      signal,
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      switch (response.status) {
-        case 400: return { status: 400, error: "GigaChat runner rejected the prompt", code: "bad_request" };
-        case 408: return { status: 408, error: "GigaChat request canceled", code: "canceled" };
-        case 429: return { status: 429, error: "GigaChat rate limit exceeded", code: "rate_limited" };
-        case 503: return { status: 503, error: "GigaChat runner is unavailable", code: "model_unavailable" };
-        case 504: return { status: 504, error: "GigaChat request timed out", code: "timeout" };
-        default: return { status: 502, error: "GigaChat runner request failed", code: "upstream" };
+    const payload = cookie.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const { exp } = JSON.parse(atob(payload));
+    return Number.isFinite(exp) ? exp * 1000 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function openGigachatSession(origin, signal) {
+  const deviceID = crypto.randomUUID();
+  const response = await fetch(origin + gigachatInitPath, {
+    method: "POST",
+    headers: {
+      ...gigachatHeaders(origin, deviceID, crypto.randomUUID()),
+      "X-Application-Name": "gigachat-b2c-web",
+      "X-Application-Version": "0.95.4",
+      "Accept": "application/json, text/plain, */*",
+    },
+    redirect: "manual",
+    signal: AbortSignal.any([signal, AbortSignal.timeout(12_000)]),
+  });
+  await checkGigachatResponse(response, "session initialization");
+  const cookies = response.headers.getSetCookie().map((header) => header.split(";", 1)[0]);
+  await response.body?.cancel();
+  const token = cookies.find((cookie) => cookie.startsWith("_sd_public="));
+  const sticky = cookies.find((cookie) => cookie.startsWith("sticky_cookie_km="));
+  const expiresAt = token ? gigachatCookieExpiry(token.slice("_sd_public=".length)) : 0;
+  if (!sticky || expiresAt <= Date.now()) {
+    throw new GigachatError(502, "GigaChat returned an invalid session", "upstream_auth");
+  }
+  return { origin, deviceID, expiresAt, cookie: `${token}; ${sticky}` };
+}
+
+function takeGigachatSession(origin) {
+  const cutoff = Date.now() + 30_000;
+  for (let index = gigachatSessions.length - 1; index >= 0; index--) {
+    const session = gigachatSessions[index];
+    if (session.origin === origin && session.expiresAt > cutoff) {
+      gigachatSessions.splice(index, 1);
+      return session;
+    }
+    if (session.expiresAt <= cutoff) gigachatSessions.splice(index, 1);
+  }
+  return null;
+}
+
+async function readGigachatSSE(body, resetIdleTimeout) {
+  const decoder = new TextDecoder();
+  const deltas = [];
+  let pending = "";
+  let finalAnswer = "";
+  let bytes = 0;
+
+  function processLine(line) {
+    if (!line.startsWith("data:")) return false;
+    const data = line.slice(5).trim();
+    if (data === "[DONE]") return true;
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      return false;
+    }
+    if (event?.status === "ERROR") {
+      throw new GigachatError(502, "GigaChat stream reported an error", "upstream", true);
+    }
+    if (typeof event?.delta === "string") deltas.push(event.delta);
+    const message = event?.message;
+    if (["ACTIVE", "READY", "DONE"].includes(message?.status) && typeof message.value === "string") {
+      finalAnswer = message.value;
+    }
+    return ["READY", "DONE"].includes(event?.status) || event?.finish_reason != null;
+  }
+
+  stream: for await (const chunk of body) {
+    resetIdleTimeout();
+    bytes += chunk.byteLength;
+    if (bytes > 2 * 1024 * 1024) throw new GigachatError(502, "GigaChat response exceeds the size limit");
+    const lines = (pending + decoder.decode(chunk, { stream: true })).split("\n");
+    pending = lines.pop();
+    for (const line of lines) {
+      if (processLine(line)) {
+        pending = "";
+        break stream;
       }
     }
-    const result = await response.json();
-    if (typeof result?.answer === "string" && result.answer.trim()) return { answer: result.answer };
-    return { status: 502, error: "GigaChat runner returned no answer", code: "upstream" };
-  } catch {
-    if (deadline.aborted) return { status: 504, error: "GigaChat request timed out", code: "timeout" };
-    if (request.signal.aborted) return { status: 408, error: "GigaChat request canceled", code: "canceled" };
-    return { status: 502, error: "GigaChat runner request failed", code: "upstream" };
+  }
+  if (pending) processLine(pending + decoder.decode());
+  const answer = finalAnswer || deltas.join("");
+  if (!answer.trim()) throw new GigachatError(502, "GigaChat returned no answer", "upstream", true);
+  return answer;
+}
+
+async function askGigachat(session, prompt, requestID, signal) {
+  const idle = new AbortController();
+  let idleTimer;
+  function resetIdleTimeout() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => idle.abort(), 20_000);
+  }
+  try {
+    const response = await fetch(session.origin + gigachatChatPath, {
+      method: "POST",
+      headers: {
+        ...gigachatHeaders(session.origin, session.deviceID, requestID),
+        "X-Project-Id": session.deviceID,
+        "X-Sm-User-Id": session.deviceID,
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+        "Cookie": session.cookie,
+      },
+      body: JSON.stringify({ text: prompt, featureFlags: [] }),
+      redirect: "manual",
+      signal: AbortSignal.any([signal, idle.signal, AbortSignal.timeout(60_000)]),
+    });
+    await checkGigachatResponse(response, "chat");
+    if (!response.body || !response.headers.get("Content-Type")?.startsWith("text/event-stream")) {
+      await response.body?.cancel();
+      throw new GigachatError(502, "GigaChat returned an invalid chat stream");
+    }
+    resetIdleTimeout();
+    return await readGigachatSSE(response.body, resetIdleTimeout);
+  } catch (error) {
+    if (idle.signal.aborted) throw new GigachatError(504, "GigaChat stream timed out", "timeout", true);
+    throw error;
+  } finally {
+    clearTimeout(idleTimer);
+  }
+}
+
+async function runGigachatQuery(request, env, prompt) {
+  const origin = gigachatBaseURL(env);
+  if (!origin) return { status: 503, error: "GigaChat upstream URL is invalid", code: "model_unavailable" };
+  if (new TextEncoder().encode(prompt).length > 20_000) {
+    return { status: 400, error: "GigaChat prompt exceeds 20,000 bytes", code: "bad_request" };
+  }
+
+  const deadline = AbortSignal.timeout(300_000);
+  const signal = AbortSignal.any([request.signal, deadline]);
+  const requestID = crypto.randomUUID();
+  const maxAttempts = 3;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      signal.throwIfAborted();
+      const session = takeGigachatSession(origin) ?? await openGigachatSession(origin, signal);
+      const answer = await askGigachat(session, prompt, requestID, signal);
+      if (session.expiresAt > Date.now() + 30_000 && gigachatSessions.length < 4) {
+        gigachatSessions.push(session);
+      }
+      return { answer };
+    } catch (error) {
+      if (request.signal.aborted) return { status: 408, error: "GigaChat request canceled", code: "canceled" };
+      if (deadline.aborted) return { status: 504, error: "GigaChat request timed out", code: "timeout" };
+      const failure = error instanceof GigachatError ? error : error.name === "TimeoutError"
+        ? new GigachatError(504, "GigaChat request timed out", "timeout", true)
+        : new GigachatError(502, "GigaChat request failed", "upstream", true);
+      if (attempt >= maxAttempts || !failure.retryable) {
+        return { status: failure.status, error: failure.message, code: failure.code };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
+    }
   }
 }
 
@@ -622,7 +781,7 @@ export default {
         if (!authorized(request, env)) return openAIError(401, "Invalid API key", "invalid_api_key");
         return Response.json({
           object: "list",
-          data: gigachatEndpoint(env) ? [aliceModel, gigachatModel] : [aliceModel],
+          data: [aliceModel, gigachatModel],
         });
       case "/v1/chat/completions":
         if (request.method === "POST") return chat(request, env);
