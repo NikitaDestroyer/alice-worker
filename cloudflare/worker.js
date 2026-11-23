@@ -2,7 +2,8 @@ const aliceURL = "https://uniproxy.alice.yandex.ru/uni.ws";
 const aliceOrigin = "https://alice.yandex.ru";
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
 const applicationID = "ru.yandex.webstandalone.desktop";
-const modelID = "alice";
+const aliceModel = { id: "alice", object: "model", created: 0, owned_by: "yandex" };
+const gigachatModel = { id: "gigachat", object: "model", created: 0, owned_by: "sber" };
 const maxBodyBytes = 256 * 1024;
 const decoder = new TextDecoder();
 
@@ -450,8 +451,61 @@ async function query(request, env) {
 }
 
 function openAIError(status, message, code, param = null) {
-  const type = status >= 500 ? "server_error" : "invalid_request_error";
+  let type = "invalid_request_error";
+  if (status === 429) type = "rate_limit_error";
+  if (status >= 500) type = "server_error";
   return Response.json({ error: { message, type, param, code } }, { status });
+}
+
+function gigachatEndpoint(env) {
+  if (!env.GIGACHAT_RUNNER_URL) return null;
+  try {
+    const url = new URL(env.GIGACHAT_RUNNER_URL);
+    const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback)) return null;
+    if (url.username || url.password || url.search || url.hash) return null;
+    url.pathname = url.pathname.replace(/\/+$/, "") + "/query";
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+async function runGigachatQuery(request, env, prompt) {
+  const endpoint = gigachatEndpoint(env);
+  if (!endpoint) return { status: 503, error: "GigaChat runner is not configured", code: "model_unavailable" };
+
+  const headers = { "Content-Type": "application/json", Accept: "application/json" };
+  if (env.GIGACHAT_RUNNER_TOKEN) headers.Authorization = "Bearer " + env.GIGACHAT_RUNNER_TOKEN;
+  const deadline = AbortSignal.timeout(300_000);
+  const signal = AbortSignal.any([request.signal, deadline]);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ prompt }),
+      redirect: "manual",
+      signal,
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      switch (response.status) {
+        case 400: return { status: 400, error: "GigaChat runner rejected the prompt", code: "bad_request" };
+        case 408: return { status: 408, error: "GigaChat request canceled", code: "canceled" };
+        case 429: return { status: 429, error: "GigaChat rate limit exceeded", code: "rate_limited" };
+        case 503: return { status: 503, error: "GigaChat runner is unavailable", code: "model_unavailable" };
+        case 504: return { status: 504, error: "GigaChat request timed out", code: "timeout" };
+        default: return { status: 502, error: "GigaChat runner request failed", code: "upstream" };
+      }
+    }
+    const result = await response.json();
+    if (typeof result?.answer === "string" && result.answer.trim()) return { answer: result.answer };
+    return { status: 502, error: "GigaChat runner returned no answer", code: "upstream" };
+  } catch {
+    if (deadline.aborted) return { status: 504, error: "GigaChat request timed out", code: "timeout" };
+    if (request.signal.aborted) return { status: 408, error: "GigaChat request canceled", code: "canceled" };
+    return { status: 502, error: "GigaChat runner request failed", code: "upstream" };
+  }
 }
 
 function chatPrompt(messages) {
@@ -476,10 +530,10 @@ function chatPrompt(messages) {
   return messages.map((message, index) => `${message.role}: ${contents[index]}`).join("\n\n");
 }
 
-function chatResponse(answer, stream) {
+function chatResponse(answer, model, stream) {
   const id = "chatcmpl-" + crypto.randomUUID().replace(/-/g, "");
   const created = Math.floor(Date.now() / 1000);
-  const metadata = { id, created, model: modelID };
+  const metadata = { id, created, model };
   if (!stream) {
     return Response.json({
       ...metadata,
@@ -495,7 +549,7 @@ function chatResponse(answer, stream) {
       choices: [{ index: 0, delta, finish_reason: finishReason, logprobs: null }],
     }) + "\n\n";
   }
-  // Alice sends cumulative snapshots that can change. Emit only the final text.
+  // Both backends provide final text to this adapter.
   const body = chunk({ role: "assistant", content: "" }) +
     chunk({ content: answer }) + chunk({}, "stop") + "data: [DONE]\n\n";
   return new Response(body, {
@@ -517,7 +571,9 @@ async function chat(request, env) {
   if (typeof input.model !== "string" || !input.model) {
     return openAIError(400, "model is required", "missing_required_parameter", "model");
   }
-  if (input.model !== modelID) return openAIError(404, "Model not found", "model_not_found", "model");
+  if (input.model !== aliceModel.id && input.model !== gigachatModel.id) {
+    return openAIError(404, "Model not found", "model_not_found", "model");
+  }
 
   for (const [param, supported] of [
     ["stream", input.stream == null || typeof input.stream === "boolean"],
@@ -541,9 +597,11 @@ async function chat(request, env) {
   } catch (error) {
     return openAIError(400, error.message, "invalid_messages", "messages");
   }
-  const result = await runQuery(request, env, prompt);
+  const result = input.model === gigachatModel.id
+    ? await runGigachatQuery(request, env, prompt)
+    : await runQuery(request, env, prompt);
   if (result.error) return openAIError(result.status, result.error, result.code);
-  return chatResponse(result.answer, input.stream);
+  return chatResponse(result.answer, input.model, input.stream);
 }
 
 export default {
@@ -564,7 +622,7 @@ export default {
         if (!authorized(request, env)) return openAIError(401, "Invalid API key", "invalid_api_key");
         return Response.json({
           object: "list",
-          data: [{ id: modelID, object: "model", created: 0, owned_by: "yandex" }],
+          data: gigachatEndpoint(env) ? [aliceModel, gigachatModel] : [aliceModel],
         });
       case "/v1/chat/completions":
         if (request.method === "POST") return chat(request, env);
