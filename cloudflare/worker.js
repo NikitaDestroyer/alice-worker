@@ -1,3 +1,6 @@
+import { ChatInputError, chatMessages, chatOutput, chatPrompt, chatTools } from "./chat-tools.js";
+import { runGigachatAPI } from "./gigachat-api.js";
+
 const aliceURL = "https://uniproxy.alice.yandex.ru/uni.ws";
 const aliceOrigin = "https://alice.yandex.ru";
 const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 YaBrowser/26.3.0.0 Safari/537.36";
@@ -389,10 +392,10 @@ function authorized(request, env) {
   return !env.ALICE_API_TOKEN || (auth?.startsWith("Bearer ") && auth.slice(7).trim() === env.ALICE_API_TOKEN);
 }
 
-async function runQuery(request, env, prompt) {
+async function runQuery(request, env, prompt, { tools = false } = {}) {
   const options = {
     maxAttempts: integer(env.ALICE_MAX_ATTEMPTS, 3, 1),
-    minAnswerLen: integer(env.ALICE_MIN_ANSWER_LEN, 140, 0),
+    minAnswerLen: tools ? 1 : integer(env.ALICE_MIN_ANSWER_LEN, 140, 0),
     handshakeTimeout: duration(env.ALICE_HANDSHAKE_TIMEOUT, 15_000),
     streamTimeout: duration(env.ALICE_STREAM_TIMEOUT, 90_000),
     queryTimeout: duration(env.ALICE_QUERY_TIMEOUT, 120_000),
@@ -667,37 +670,18 @@ async function runGigachatQuery(request, env, prompt) {
   }
 }
 
-function chatPrompt(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    throw new Error("messages must be a non-empty array");
-  }
-  const roles = ["system", "developer", "user", "assistant"];
-  const contents = messages.map((message) => {
-    if (!roles.includes(message?.role) || message.tool_calls != null || message.function_call != null) {
-      throw new Error("messages must use system, developer, user, or assistant roles with text");
-    }
-    if (typeof message.content === "string") return message.content;
-    if (Array.isArray(message.content) && message.content.every((part) =>
-      part?.type === "text" && typeof part.text === "string"
-    )) {
-      return message.content.map((part) => part.text).join("\n");
-    }
-    throw new Error("message content must be text");
-  });
-  if (!contents.some((content) => content.trim())) throw new Error("messages must contain text");
-  if (messages.length === 1 && messages[0].role === "user") return contents[0];
-  return messages.map((message, index) => `${message.role}: ${contents[index]}`).join("\n\n");
-}
-
-function chatResponse(answer, model, stream) {
+function chatResponse({ content, toolCall }, model, stream, truncated = false) {
   const id = "chatcmpl-" + crypto.randomUUID().replace(/-/g, "");
   const created = Math.floor(Date.now() / 1000);
   const metadata = { id, created, model };
+  const finish = toolCall ? "tool_calls" : truncated ? "length" : "stop";
+  const message = { role: "assistant", content, refusal: null };
+  if (toolCall) message.tool_calls = [toolCall];
   if (!stream) {
     return Response.json({
       ...metadata,
       object: "chat.completion",
-      choices: [{ index: 0, message: { role: "assistant", content: answer, refusal: null }, finish_reason: "stop", logprobs: null }],
+      choices: [{ index: 0, message, finish_reason: finish, logprobs: null }],
     });
   }
 
@@ -709,8 +693,9 @@ function chatResponse(answer, model, stream) {
     }) + "\n\n";
   }
   // Both backends provide final text to this adapter.
+  const delta = toolCall ? { tool_calls: [{ index: 0, ...toolCall }] } : { content };
   const body = chunk({ role: "assistant", content: "" }) +
-    chunk({ content: answer }) + chunk({}, "stop") + "data: [DONE]\n\n";
+    chunk(delta) + chunk({}, finish) + "data: [DONE]\n\n";
   return new Response(body, {
     headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" },
   });
@@ -737,8 +722,7 @@ async function chat(request, env) {
   for (const [param, supported] of [
     ["stream", input.stream == null || typeof input.stream === "boolean"],
     ["n", input.n == null || input.n === 1],
-    ["tools", input.tools == null || (Array.isArray(input.tools) && input.tools.length === 0)],
-    ["tool_choice", input.tool_choice == null || input.tool_choice === "none"],
+    ["parallel_tool_calls", input.parallel_tool_calls == null || typeof input.parallel_tool_calls === "boolean"],
     ["functions", input.functions == null],
     ["function_call", input.function_call == null || input.function_call === "none"],
     ["response_format", input.response_format == null || input.response_format.type === "text"],
@@ -750,17 +734,36 @@ async function chat(request, env) {
     if (!supported) return openAIError(400, `Unsupported value for ${param}`, "unsupported_value", param);
   }
 
+  let tools;
   let prompt;
   try {
-    prompt = chatPrompt(input.messages);
+    tools = chatTools(input);
+    prompt = chatPrompt(chatMessages(input.messages), tools);
   } catch (error) {
-    return openAIError(400, error.message, "invalid_messages", "messages");
+    if (!(error instanceof ChatInputError)) throw error;
+    return openAIError(400, error.message, "invalid_" + error.param, error.param);
   }
-  const result = input.model === gigachatModel.id
-    ? await runGigachatQuery(request, env, prompt)
-    : await runQuery(request, env, prompt);
+  let result;
+  if (input.model === gigachatModel.id) {
+    if (env.GIGACHAT_AUTH_KEY && !env.ALICE_API_TOKEN) {
+      return openAIError(503, "The authenticated GigaChat route requires worker authentication", "model_unavailable");
+    }
+    result = env.GIGACHAT_AUTH_KEY
+      ? await runGigachatAPI(request, env, prompt)
+      : await runGigachatQuery(request, env, prompt);
+  } else {
+    result = await runQuery(request, env, prompt, { tools: tools.offered.size > 0 });
+  }
   if (result.error) return openAIError(result.status, result.error, result.code);
-  return chatResponse(result.answer, input.model, input.stream);
+  try {
+    if (result.truncated && tools.offered.size) {
+      return openAIError(502, "The model response was truncated before a tool decision could be read", "invalid_tool_call");
+    }
+    const output = chatOutput(result.answer, tools);
+    return chatResponse(output, input.model, input.stream, result.truncated);
+  } catch (error) {
+    return openAIError(502, error.message, "invalid_tool_call");
+  }
 }
 
 export default {
