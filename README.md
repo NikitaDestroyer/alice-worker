@@ -21,8 +21,8 @@ npx wrangler@4.166.0 login
 npx wrangler@4.166.0 deploy --secrets-file .env.production
 ```
 
-For a dashboard deployment, create a Worker, paste `cloudflare/worker.js` into its
-code editor, and use the compatibility date and flags from `wrangler.jsonc`.
+For a dashboard deployment, use the bundled output from the Wrangler dry run
+and the compatibility date and flags from `wrangler.jsonc`.
 Add `ALICE_API_TOKEN` as a secret under **Settings → Variables and Secrets**.
 `/healthz` stays public. With the token unset, the other endpoints also accept
 requests without authentication.
@@ -44,7 +44,12 @@ protocol testing, set `GIGACHAT_BASE_URL` to the origin of a fixture that
 implements the GigaChat session and chat endpoints.
 
 If GigaChat rejects anonymous session initialization, the completion endpoint
-returns HTTP `502` with the OpenAI error code `upstream_auth`.
+returns HTTP `502` with the OpenAI error code `upstream_auth`. Set
+`GIGACHAT_AUTH_KEY` and `ALICE_API_TOKEN` as Worker secrets to use the authenticated
+GigaChat API.
+`GIGACHAT_SCOPE` defaults to `GIGACHAT_API_PERS`. Set `GIGACHAT_MODEL` to select
+the upstream model, which defaults to `GigaChat`. The 20,000-byte prompt limit
+applies to the anonymous route.
 
 ### OpenAI-compatible chat
 
@@ -68,7 +73,14 @@ console.log(completion.choices[0].message.content);
 
 Chat completions accept text messages and return one choice. With `stream: true`,
 the Worker sends OpenAI-compatible SSE events after the backend returns its
-answer. Chat history is combined into one prompt. Both backends control
-generation settings such as temperature. This interface accepts text only and
-returns no tool calls, structured output, or token usage. Use `POST /query` for
-Alice answers with structured source citations.
+answer. For function calling, send OpenAI `tools` and an optional `tool_choice`
+(`auto`, `none`, `required`, or a named function). The Worker asks the backend
+for a textual tool decision and converts it to a single `tool_calls` entry.
+The client executes the function and sends back the assistant tool call and a
+`tool` message with the matching `tool_call_id`. Function arguments must be a
+JSON object. Validate them against your schema before execution.
+
+Chat history is combined into one prompt. Both backends control generation
+settings such as temperature. This interface accepts text and function
+results. Structured outputs and token usage are unavailable. Use `POST /query`
+for Alice answers with structured source citations.
